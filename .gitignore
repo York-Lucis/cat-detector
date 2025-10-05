@@ -1,0 +1,5 @@
+# Model files
+*.pt
+
+# Cat profiles
+*cat_profiles/*
