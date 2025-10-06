@@ -5,7 +5,7 @@ from sklearn.cluster import KMeans
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, Listbox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import shutil
 import threading
 import torch
@@ -15,11 +15,52 @@ from datetime import datetime
 
 # --- Configuration ---
 PROFILES_FOLDER = "cat_profiles"
-COLOR_MATCH_TOLERANCE = 35  # Slightly increased tolerance
+COLOR_MATCH_TOLERANCE = 35
 PROFILE_FILENAME = "profile.npy"
 PROFILE_METADATA_FILENAME = "profile.json"
 VIDEO_RECORDINGS_FOLDER = "video_recordings"
 MAX_RECORDING_DURATION = 60  # Maximum recording duration in seconds
+CONFIDENCE_THRESHOLD = 0.65  # Minimum YOLO confidence to consider a detection for color matching
+RECORDING_COOLDOWN = 5      # Seconds to wait after cat disappears before stopping recording
+
+def draw_unicode_text(frame, text, position, font_scale=0.7, color=(0, 255, 0), thickness=2):
+    """
+    Draw text with Unicode support using PIL instead of OpenCV's putText.
+    This handles special characters like Ç, ñ, é, etc.
+    """
+    try:
+        # Convert BGR to RGB for PIL
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_image)
+        
+        # Try to use a system font that supports Unicode
+        try:
+            # Try different font sizes
+            font_size = int(font_scale * 20)
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", int(font_scale * 20))
+            except:
+                # Fallback to default font
+                font = ImageFont.load_default()
+        
+        # Convert BGR color to RGB for PIL
+        rgb_color = (color[2], color[1], color[0])
+        
+        # Draw text
+        draw.text(position, text, font=font, fill=rgb_color)
+        
+        # Convert back to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        return frame_bgr
+    except Exception as e:
+        # Fallback to OpenCV putText if PIL fails
+        print(f"Unicode text drawing failed, using fallback: {e}")
+        cv2.putText(frame, text.encode('ascii', 'replace').decode('ascii'), position, 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+        return frame
 
 class ProfileCreationDialog(simpledialog.Dialog):
     """A custom dialog to get detailed info for a new cat profile."""
@@ -82,9 +123,21 @@ class ProfileManager(tk.Toplevel):
 
     def populate_list(self):
         self.profile_listbox.delete(0, tk.END)
-        profiles = [d for d in os.listdir(PROFILES_FOLDER) if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
-        for profile in sorted(profiles):
-            self.profile_listbox.insert(tk.END, profile)
+        try:
+            profiles = [d for d in os.listdir(PROFILES_FOLDER) if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
+            for profile in sorted(profiles):
+                self.profile_listbox.insert(tk.END, profile)
+        except UnicodeDecodeError as e:
+            print(f"Unicode error reading profiles directory: {e}")
+            # Fallback: try with different encoding
+            try:
+                profiles = [d.encode('utf-8', 'replace').decode('utf-8') for d in os.listdir(PROFILES_FOLDER) 
+                           if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
+                for profile in sorted(profiles):
+                    self.profile_listbox.insert(tk.END, profile)
+            except Exception as e2:
+                print(f"Failed to read profiles directory: {e2}")
+                self.profile_listbox.insert(tk.END, "Error reading profiles")
 
     def add_profile(self):
         dialog = ProfileCreationDialog(self, "Create New Cat Profile")
@@ -117,12 +170,10 @@ class ProfileManager(tk.Toplevel):
         thread.start()
 
     def _process_profile_creation(self, profile_data, profile_path, filepaths):
-        """Worker function to be run in a background thread."""
         os.makedirs(profile_path, exist_ok=True)
         
-        # Save metadata
-        with open(os.path.join(profile_path, PROFILE_METADATA_FILENAME), 'w') as f:
-            json.dump(profile_data, f, indent=4)
+        with open(os.path.join(profile_path, PROFILE_METADATA_FILENAME), 'w', encoding='utf-8') as f:
+            json.dump(profile_data, f, indent=4, ensure_ascii=False)
 
         for path in filepaths:
             shutil.copy(path, profile_path)
@@ -131,7 +182,6 @@ class ProfileManager(tk.Toplevel):
         self.after(0, self._finish_profile_creation, success, profile_data['profile_name'], profile_path)
 
     def _finish_profile_creation(self, success, profile_name, profile_path):
-        """Updates the GUI after background processing is complete."""
         if success:
             messagebox.showinfo("Success", f"Profile '{profile_name}' was created successfully.", parent=self)
         else:
@@ -144,7 +194,6 @@ class ProfileManager(tk.Toplevel):
         self.delete_button.config(state="normal")
 
     def create_color_profile_file(self, profile_path):
-        """Analyzes images and saves a dominant color profile file."""
         image_files = [f for f in os.listdir(profile_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
         all_dominant_colors = []
         for filename in image_files:
@@ -197,11 +246,8 @@ class CatDetectorApp:
         self.is_recording = False
         self.video_writer = None
         self.recording_start_time = None
-        self.recording_cat_name = None
-        self.recording_fps = 30
-        self.recording_width = 640
-        self.recording_height = 480
-
+        self.last_seen_time = None
+        
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -253,9 +299,18 @@ class CatDetectorApp:
         self.load_and_populate_profiles()
 
     def load_and_populate_profiles(self):
-        """Scans profile folders, loads .npy and .json files, and populates the dropdown."""
         self.profiles.clear()
-        profile_names = [d for d in os.listdir(PROFILES_FOLDER) if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
+        try:
+            profile_names = [d for d in os.listdir(PROFILES_FOLDER) if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
+        except UnicodeDecodeError as e:
+            print(f"Unicode error reading profiles directory: {e}")
+            # Fallback: try with different encoding
+            try:
+                profile_names = [d.encode('utf-8', 'replace').decode('utf-8') for d in os.listdir(PROFILES_FOLDER) 
+                               if os.path.isdir(os.path.join(PROFILES_FOLDER, d))]
+            except Exception as e2:
+                print(f"Failed to read profiles directory: {e2}")
+                profile_names = []
         
         for name in profile_names:
             profile_file = os.path.join(PROFILES_FOLDER, name, PROFILE_FILENAME)
@@ -263,7 +318,7 @@ class CatDetectorApp:
 
             if os.path.exists(profile_file) and os.path.exists(metadata_file):
                 try:
-                    with open(metadata_file, 'r') as f:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
                         metadata = json.load(f)
                     metadata['signature'] = np.load(profile_file)
                     self.profiles[name] = metadata
@@ -287,83 +342,48 @@ class CatDetectorApp:
         self.root.wait_window(manager)
         self.profile_button.config(state="normal")
 
-    def start_video_recording(self, cat_name):
-        """Start recording video when a specific cat is detected."""
-        if self.is_recording:
-            return  # Already recording
-        
+    def start_video_recording(self, cat_name, frame):
+        if self.is_recording: return
         try:
-            # Create timestamped folder for this recording session
+            height, width, _ = frame.shape
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_folder = os.path.join(VIDEO_RECORDINGS_FOLDER, f"{cat_name}_{timestamp}")
-            os.makedirs(session_folder, exist_ok=True)
+            filename = os.path.join(VIDEO_RECORDINGS_FOLDER, f"{cat_name}_{timestamp}.mp4")
             
-            # Initialize video writer
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_filename = os.path.join(session_folder, f"{cat_name}_recording.mp4")
-            self.video_writer = cv2.VideoWriter(
-                video_filename, 
-                fourcc, 
-                self.recording_fps, 
-                (self.recording_width, self.recording_height)
-            )
+            self.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (width, height))
             
-            if not self.video_writer.isOpened():
-                raise Exception("Could not initialize video writer")
+            if not self.video_writer.isOpened(): raise Exception("Could not initialize video writer")
             
             self.is_recording = True
             self.recording_start_time = time.time()
-            self.recording_cat_name = cat_name
-            
-            self.status_var.set(f"Status: Recording {cat_name}... | Duration: 0s")
-            print(f"Started recording {cat_name} at {timestamp}")
-            
+            print(f"✅ Started recording {cat_name} to {filename}")
         except Exception as e:
-            print(f"Error starting video recording: {e}")
-            self.status_var.set(f"Status: Recording error - {str(e)}")
+            print(f"❌ Error starting video recording: {e}")
+            self.status_var.set(f"Status: Recording error")
 
     def stop_video_recording(self):
-        """Stop recording and save the video."""
-        if not self.is_recording or not self.video_writer:
-            return
-        
+        if not self.is_recording or not self.video_writer: return
         try:
             self.video_writer.release()
             self.video_writer = None
-            
-            duration = time.time() - self.recording_start_time if self.recording_start_time else 0
-            cat_name = self.recording_cat_name or "Unknown"
-            
-            self.status_var.set(f"Status: Saved {cat_name} recording ({duration:.1f}s)")
-            print(f"Stopped recording {cat_name}, duration: {duration:.1f}s")
-            
+            print(f"✅ Stopped recording.")
         except Exception as e:
-            print(f"Error stopping video recording: {e}")
-            self.status_var.set(f"Status: Error saving recording - {str(e)}")
+            print(f"❌ Error stopping video recording: {e}")
         finally:
             self.is_recording = False
             self.recording_start_time = None
-            self.recording_cat_name = None
+            self.last_seen_time = None
 
     def write_frame_to_video(self, frame):
-        """Write a frame to the current video recording."""
         if self.is_recording and self.video_writer:
             try:
-                # Resize frame to recording dimensions
-                resized_frame = cv2.resize(frame, (self.recording_width, self.recording_height))
-                self.video_writer.write(resized_frame)
-                
-                # Check if maximum recording duration reached
-                if self.recording_start_time:
-                    elapsed_time = time.time() - self.recording_start_time
-                    if elapsed_time >= MAX_RECORDING_DURATION:
-                        self.stop_video_recording()
-                    else:
-                        # Update status with recording duration
-                        self.status_var.set(f"Status: Recording {self.recording_cat_name}... | Duration: {elapsed_time:.1f}s")
-                        
+                self.video_writer.write(frame)
+                elapsed_time = time.time() - self.recording_start_time
+                self.status_var.set(f"Status: RECORDING... | Duration: {elapsed_time:.1f}s")
+                if elapsed_time >= MAX_RECORDING_DURATION:
+                    self.stop_video_recording()
             except Exception as e:
-                print(f"Error writing frame to video: {e}")
+                print(f"❌ Error writing frame to video: {e}")
                 self.stop_video_recording()
 
     def toggle_webcam(self):
@@ -371,13 +391,10 @@ class CatDetectorApp:
             self.is_running = False
             self.toggle_button.config(text="Start Webcam")
             if self.cap: self.cap.release()
-            # Stop any ongoing recording when webcam is stopped
-            if self.is_recording:
-                self.stop_video_recording()
+            if self.is_recording: self.stop_video_recording()
             self.video_label.config(image='', background='black', text="Webcam feed stopped.")
         else:
             if not self.model: return messagebox.showerror("Error", "Model is not loaded yet.")
-            
             selected_profile_name = self.profile_var.get()
             if selected_profile_name == "None (General Detection)": self.active_profile = None
             else: self.active_profile = self.profiles.get(selected_profile_name)
@@ -397,23 +414,19 @@ class CatDetectorApp:
         ret, frame = self.cap.read()
         if ret:
             results = self.model(frame, verbose=False, device=self.device)
-            profile_name = self.profile_var.get()
             
-            # Check if we're currently recording and update status accordingly
             if not self.is_recording:
+                profile_name = self.profile_var.get()
                 self.status_var.set(f"Status: Detecting... | Profile: {profile_name} | Device: {self.device.upper()}")
 
-            cat_detected = False
-            specific_cat_detected = False
+            specific_cat_detected_this_frame = False
             detected_cat_name = None
 
             for result in results:
                 cat_class_id = 15 # YOLOv8 COCO class for 'cat'
                 for box in result.boxes:
-                    if int(box.cls[0]) == cat_class_id:
-                        cat_detected = True
+                    if int(box.cls[0]) == cat_class_id and float(box.conf[0]) > CONFIDENCE_THRESHOLD:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        
                         box_color, text, thickness = ((0, 255, 0), f"Cat: {float(box.conf[0]):.2f}", 2)
 
                         if self.active_profile and 'signature' in self.active_profile:
@@ -424,24 +437,23 @@ class CatDetectorApp:
                                 color_dist = np.linalg.norm(avg_color - self.active_profile['signature'])
                                 
                                 if color_dist < COLOR_MATCH_TOLERANCE:
-                                    specific_cat_detected = True
+                                    specific_cat_detected_this_frame = True
                                     display_name = self.active_profile.get('display_name', 'Match')
                                     detected_cat_name = display_name
+                                    self.last_seen_time = time.time()
                                     box_color, text, thickness = ((0, 0, 255), f"!!! {display_name} !!!", 3)
                         
                         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, thickness)
-                        cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
+                        frame = draw_unicode_text(frame, text, (x1, y1 - 10), 0.7, box_color, 2)
             
-            # Handle video recording logic
-            if specific_cat_detected and detected_cat_name:
-                # Start recording if not already recording
-                if not self.is_recording:
-                    self.start_video_recording(detected_cat_name)
-            elif not cat_detected and self.is_recording:
-                # Stop recording if no cats detected and we were recording
-                self.stop_video_recording()
+            # --- Robust Recording Logic ---
+            if specific_cat_detected_this_frame and detected_cat_name and not self.is_recording:
+                self.start_video_recording(detected_cat_name, frame)
             
-            # Write frame to video if recording
+            if self.is_recording and self.last_seen_time:
+                if time.time() - self.last_seen_time > RECORDING_COOLDOWN:
+                    self.stop_video_recording()
+            
             if self.is_recording:
                 self.write_frame_to_video(frame)
             
@@ -454,12 +466,27 @@ class CatDetectorApp:
     def on_closing(self):
         self.is_running = False
         if self.cap: self.cap.release()
-        # Stop any ongoing recording when application is closed
-        if self.is_recording:
-            self.stop_video_recording()
+        if self.is_recording: self.stop_video_recording()
         self.root.destroy()
 
 if __name__ == "__main__":
+    # Set UTF-8 encoding for the entire application
+    import sys
+    import locale
+    
+    # Try to set UTF-8 encoding
+    try:
+        if sys.platform.startswith('win'):
+            # On Windows, try to set UTF-8 mode
+            import codecs
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+        else:
+            # On Unix-like systems, set locale
+            locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+    except Exception as e:
+        print(f"Warning: Could not set UTF-8 encoding: {e}")
+    
     root = tk.Tk()
     app = CatDetectorApp(root)
     root.mainloop()
