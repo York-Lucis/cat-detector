@@ -10,12 +10,16 @@ import shutil
 import threading
 import torch
 import json
+import time
+from datetime import datetime
 
 # --- Configuration ---
 PROFILES_FOLDER = "cat_profiles"
 COLOR_MATCH_TOLERANCE = 35  # Slightly increased tolerance
 PROFILE_FILENAME = "profile.npy"
 PROFILE_METADATA_FILENAME = "profile.json"
+VIDEO_RECORDINGS_FOLDER = "video_recordings"
+MAX_RECORDING_DURATION = 60  # Maximum recording duration in seconds
 
 class ProfileCreationDialog(simpledialog.Dialog):
     """A custom dialog to get detailed info for a new cat profile."""
@@ -188,6 +192,15 @@ class CatDetectorApp:
         self.model = None
         self.device = None
         self.profiles = {}
+        
+        # Video recording variables
+        self.is_recording = False
+        self.video_writer = None
+        self.recording_start_time = None
+        self.recording_cat_name = None
+        self.recording_fps = 30
+        self.recording_width = 640
+        self.recording_height = 480
 
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -220,6 +233,7 @@ class CatDetectorApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         os.makedirs(PROFILES_FOLDER, exist_ok=True)
+        os.makedirs(VIDEO_RECORDINGS_FOLDER, exist_ok=True)
         self.populate_webcams()
         
         threading.Thread(target=self.initialize_backend, daemon=True).start()
@@ -273,11 +287,93 @@ class CatDetectorApp:
         self.root.wait_window(manager)
         self.profile_button.config(state="normal")
 
+    def start_video_recording(self, cat_name):
+        """Start recording video when a specific cat is detected."""
+        if self.is_recording:
+            return  # Already recording
+        
+        try:
+            # Create timestamped folder for this recording session
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_folder = os.path.join(VIDEO_RECORDINGS_FOLDER, f"{cat_name}_{timestamp}")
+            os.makedirs(session_folder, exist_ok=True)
+            
+            # Initialize video writer
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_filename = os.path.join(session_folder, f"{cat_name}_recording.mp4")
+            self.video_writer = cv2.VideoWriter(
+                video_filename, 
+                fourcc, 
+                self.recording_fps, 
+                (self.recording_width, self.recording_height)
+            )
+            
+            if not self.video_writer.isOpened():
+                raise Exception("Could not initialize video writer")
+            
+            self.is_recording = True
+            self.recording_start_time = time.time()
+            self.recording_cat_name = cat_name
+            
+            self.status_var.set(f"Status: Recording {cat_name}... | Duration: 0s")
+            print(f"Started recording {cat_name} at {timestamp}")
+            
+        except Exception as e:
+            print(f"Error starting video recording: {e}")
+            self.status_var.set(f"Status: Recording error - {str(e)}")
+
+    def stop_video_recording(self):
+        """Stop recording and save the video."""
+        if not self.is_recording or not self.video_writer:
+            return
+        
+        try:
+            self.video_writer.release()
+            self.video_writer = None
+            
+            duration = time.time() - self.recording_start_time if self.recording_start_time else 0
+            cat_name = self.recording_cat_name or "Unknown"
+            
+            self.status_var.set(f"Status: Saved {cat_name} recording ({duration:.1f}s)")
+            print(f"Stopped recording {cat_name}, duration: {duration:.1f}s")
+            
+        except Exception as e:
+            print(f"Error stopping video recording: {e}")
+            self.status_var.set(f"Status: Error saving recording - {str(e)}")
+        finally:
+            self.is_recording = False
+            self.recording_start_time = None
+            self.recording_cat_name = None
+
+    def write_frame_to_video(self, frame):
+        """Write a frame to the current video recording."""
+        if self.is_recording and self.video_writer:
+            try:
+                # Resize frame to recording dimensions
+                resized_frame = cv2.resize(frame, (self.recording_width, self.recording_height))
+                self.video_writer.write(resized_frame)
+                
+                # Check if maximum recording duration reached
+                if self.recording_start_time:
+                    elapsed_time = time.time() - self.recording_start_time
+                    if elapsed_time >= MAX_RECORDING_DURATION:
+                        self.stop_video_recording()
+                    else:
+                        # Update status with recording duration
+                        self.status_var.set(f"Status: Recording {self.recording_cat_name}... | Duration: {elapsed_time:.1f}s")
+                        
+            except Exception as e:
+                print(f"Error writing frame to video: {e}")
+                self.stop_video_recording()
+
     def toggle_webcam(self):
         if self.is_running:
             self.is_running = False
             self.toggle_button.config(text="Start Webcam")
             if self.cap: self.cap.release()
+            # Stop any ongoing recording when webcam is stopped
+            if self.is_recording:
+                self.stop_video_recording()
             self.video_label.config(image='', background='black', text="Webcam feed stopped.")
         else:
             if not self.model: return messagebox.showerror("Error", "Model is not loaded yet.")
@@ -302,12 +398,20 @@ class CatDetectorApp:
         if ret:
             results = self.model(frame, verbose=False, device=self.device)
             profile_name = self.profile_var.get()
-            self.status_var.set(f"Status: Detecting... | Profile: {profile_name} | Device: {self.device.upper()}")
+            
+            # Check if we're currently recording and update status accordingly
+            if not self.is_recording:
+                self.status_var.set(f"Status: Detecting... | Profile: {profile_name} | Device: {self.device.upper()}")
+
+            cat_detected = False
+            specific_cat_detected = False
+            detected_cat_name = None
 
             for result in results:
                 cat_class_id = 15 # YOLOv8 COCO class for 'cat'
                 for box in result.boxes:
                     if int(box.cls[0]) == cat_class_id:
+                        cat_detected = True
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         
                         box_color, text, thickness = ((0, 255, 0), f"Cat: {float(box.conf[0]):.2f}", 2)
@@ -320,11 +424,26 @@ class CatDetectorApp:
                                 color_dist = np.linalg.norm(avg_color - self.active_profile['signature'])
                                 
                                 if color_dist < COLOR_MATCH_TOLERANCE:
+                                    specific_cat_detected = True
                                     display_name = self.active_profile.get('display_name', 'Match')
+                                    detected_cat_name = display_name
                                     box_color, text, thickness = ((0, 0, 255), f"!!! {display_name} !!!", 3)
                         
                         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, thickness)
                         cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
+            
+            # Handle video recording logic
+            if specific_cat_detected and detected_cat_name:
+                # Start recording if not already recording
+                if not self.is_recording:
+                    self.start_video_recording(detected_cat_name)
+            elif not cat_detected and self.is_recording:
+                # Stop recording if no cats detected and we were recording
+                self.stop_video_recording()
+            
+            # Write frame to video if recording
+            if self.is_recording:
+                self.write_frame_to_video(frame)
             
             img_tk = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
             self.video_label.imgtk = img_tk
@@ -335,6 +454,9 @@ class CatDetectorApp:
     def on_closing(self):
         self.is_running = False
         if self.cap: self.cap.release()
+        # Stop any ongoing recording when application is closed
+        if self.is_recording:
+            self.stop_video_recording()
         self.root.destroy()
 
 if __name__ == "__main__":
